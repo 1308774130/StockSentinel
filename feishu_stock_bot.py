@@ -786,6 +786,12 @@ def main():
     # 如果是单次运行模式（用于 GitHub Actions）
     if is_once:
         print("🚀 单次运行模式启动...")
+        # 发送启动通知（可选，用于确认运行状态）
+        notifier.send_card(
+            "🤖 股票监控运行中",
+            f"GitHub Actions 定时任务已触发\n⏰ {datetime.now().strftime('%H:%M:%S')}",
+            "blue"
+        )
         monitor.check_all_stocks()
         print("✅ 单次检查完成")
         return
