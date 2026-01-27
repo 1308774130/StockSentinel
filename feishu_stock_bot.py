@@ -26,7 +26,8 @@ class Config:
     # 飞书配置
     FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
     FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-    FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "https://open.feishu.cn/open-apis/bot/v2/hook/fa25dffb-041a-479c-a1d0-7dfe62e3af7a")
+    # 优先从环境变量获取，如果没有则为空（强制用户配置）
+    FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
     FEISHU_VERIFICATION_TOKEN = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
     
     # HTTP 服务器配置（用于接收飞书消息）
@@ -769,6 +770,14 @@ def main():
     
     # 初始化组件
     config = Config()
+    
+    # 检查 Webhook 是否配置
+    if not config.FEISHU_WEBHOOK:
+        print("❌ 错误: 未配置 FEISHU_WEBHOOK")
+        print("💡 请设置环境变量 FEISHU_WEBHOOK，或在 Secrets 中配置")
+        if is_once: return
+        sys.exit(1)
+        
     db = Database(config.DB_PATH)
     notifier = FeishuNotifier(config.FEISHU_WEBHOOK, config.FEISHU_APP_ID, config.FEISHU_APP_SECRET)
     monitor = StockMonitor(db, notifier, config)
