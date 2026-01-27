@@ -40,6 +40,9 @@ class Config:
     PRICE_CHANGE_THRESHOLD = 5  # 涨跌幅预警阈值(%)
     VOLUME_RATIO_THRESHOLD = 2  # 成交量放大倍数
     
+    # 股票列表（环境变量优先，用于 GitHub Actions）
+    STOCK_LIST = os.getenv("STOCK_LIST", "")
+    
     # 数据库
     DB_PATH = "stock_monitor.db"
 
@@ -89,6 +92,35 @@ class Database:
         
         conn.commit()
         conn.close()
+        
+        # 如果有环境变量配置的股票，自动添加
+        if Config.STOCK_LIST:
+            self.sync_env_stocks()
+            
+    def sync_env_stocks(self):
+        """同步环境变量中的股票到数据库"""
+        codes = Config.STOCK_LIST.split(",")
+        print(f"[INFO] 检测到环境变量配置股票: {len(codes)}只")
+        for code in codes:
+            code = code.strip()
+            if not code: continue
+            # 简单检查是否已存在，不存在则获取信息添加
+            # 这里为了简单，每次启动都尝试添加（add_stock有去重）
+            try:
+                # 只有当数据库里没有这个名字时才去联网获取，避免每次启动都大量请求
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM monitor_stocks WHERE code=?", (StockDataFetcher.normalize_code(code),))
+                res = cursor.fetchone()
+                conn.close()
+                
+                if not res:
+                    data = StockDataFetcher.get_stock_data(code)
+                    if data:
+                        self.add_stock(data["code"], data["name"])
+                        print(f"[INFO] 自动添加股票: {data['name']}")
+            except Exception as e:
+                print(f"[WARN] 自动添加股票失败 {code}: {e}")
     
     def add_stock(self, code: str, name: str, user_id: str = ""):
         """添加监控股票"""
@@ -453,22 +485,24 @@ class StockMonitor:
             self.notifier.send_alert(name, code, alerts, data)
             print(f"[ALERT] {datetime.now().strftime('%H:%M:%S')} {name} 触发 {len(alerts)} 个预警")
     
+    def check_all_stocks(self):
+        """检查所有股票一次"""
+        try:
+            stocks = self.db.get_all_stocks()
+            if not stocks:
+                print("[INFO] 没有监控的股票，等待添加...")
+            else:
+                print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} 开始检查 {len(stocks)} 只股票...")
+                for stock in stocks:
+                    self.monitor_single_stock(stock)
+        except Exception as e:
+            print(f"[ERROR] 监控检查异常: {e}")
+
     def monitor_loop(self):
         """监控主循环"""
         while self.running:
-            try:
-                stocks = self.db.get_all_stocks()
-                if not stocks:
-                    print("[INFO] 没有监控的股票，等待添加...")
-                else:
-                    print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} 开始检查 {len(stocks)} 只股票...")
-                    for stock in stocks:
-                        self.monitor_single_stock(stock)
-                
-                time.sleep(self.config.CHECK_INTERVAL)
-            except Exception as e:
-                print(f"[ERROR] 监控循环异常: {e}")
-                time.sleep(10)
+            self.check_all_stocks()
+            time.sleep(self.config.CHECK_INTERVAL)
     
     def start(self):
         """启动监控"""
@@ -722,11 +756,16 @@ def start_webhook_server(handler: CommandHandler, notifier: FeishuNotifier, conf
     return server
 
 
+import sys
+
 # ===== 主程序 =====
 def main():
     print("=" * 50)
     print("🤖 飞书股票监控机器人 v1.0")
     print("=" * 50)
+    
+    # 检查命令行参数
+    is_once = "--once" in sys.argv
     
     # 初始化组件
     config = Config()
@@ -735,6 +774,13 @@ def main():
     monitor = StockMonitor(db, notifier, config)
     handler = CommandHandler(db, notifier, monitor, config)
     
+    # 如果是单次运行模式（用于 GitHub Actions）
+    if is_once:
+        print("🚀 单次运行模式启动...")
+        monitor.check_all_stocks()
+        print("✅ 单次检查完成")
+        return
+
     # 启动监控
     monitor.start()
     

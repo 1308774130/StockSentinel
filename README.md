@@ -139,6 +139,29 @@ sudo systemctl status stock-bot  # 查看状态
 
 ---
 
+### ☁️ GitHub Actions 部署 (完全免费)
+
+利用 GitHub 免费的虚拟服务器定时运行（无需自己有服务器）。
+
+#### 1. 配置 Secrets (密钥)
+进入 GitHub 仓库 → `Settings` → `Secrets and variables` → `Actions` → `New repository secret`：
+- Name: `FEISHU_WEBHOOK`
+- Value: `你的飞书Webhook地址`
+
+#### 2. 配置 Variables (变量)
+点击 `Variables` 标签页 → `New repository variable`：
+- Name: `STOCK_LIST`
+- Value: `600519,000001,300750` (用逗号分隔股票代码)
+
+#### 3. 启用
+进入 `Actions` 标签页，启用 Workflow。它会在每个交易日 9:30-15:00 每20分钟运行一次。
+
+⚠️ **注意**：GitHub Actions 模式下不支持 @机器人 交互，只能通过修改 `STOCK_LIST` 变量来管理股票。
+
+---
+
+---
+
 ## 🤖 飞书交互命令
 
 配置应用后，可在群里 @机器人 操作

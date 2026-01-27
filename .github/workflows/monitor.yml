@@ -1,0 +1,34 @@
+name: Stock Monitor
+
+on:
+  schedule:
+    # 北京时间 9:30 - 15:00 之间，每 20 分钟运行一次
+    # UTC 时间 = 北京时间 - 8
+    # 1:30 UTC = 9:30 Beijing
+    # 7:00 UTC = 15:00 Beijing
+    - cron: '*/20 1-7 * * 1-5'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        
+    - name: Install dependencies
+      run: |
+        pip install requests
+        
+    - name: Run Monitor
+      env:
+        FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        # 在 GitHub 仓库 Settings -> Secrets and variables -> Actions -> Variables 中配置
+        STOCK_LIST: ${{ vars.STOCK_LIST }}
+      run: |
+        python feishu_stock_bot.py --once
