@@ -35,11 +35,14 @@ class Config:
     
     # 监控配置
     CHECK_INTERVAL = 60  # 检查间隔(秒)
-    RSI_PERIOD = 6  # RSI周期
-    RSI_OVERBOUGHT = 80  # RSI超买阈值
-    RSI_OVERSOLD = 20  # RSI超卖阈值
-    PRICE_CHANGE_THRESHOLD = 5  # 涨跌幅预警阈值(%)
-    VOLUME_RATIO_THRESHOLD = 2  # 成交量放大倍数
+    
+    # 策略配置 (BOLL + RSI)
+    RSI_PERIOD = 14       # RSI周期
+    RSI_OVERBOUGHT = 70   # RSI超买阈值
+    RSI_OVERSOLD = 30     # RSI超卖阈值
+    
+    BOLL_PERIOD = 20      # 布林带周期 (通常20)
+    BOLL_STD = 2          # 布林带标准差倍数 (通常2)
     
     # 股票列表（环境变量优先，用于 GitHub Actions）
     STOCK_LIST = os.getenv("STOCK_LIST", "")
@@ -264,6 +267,48 @@ class StockDataFetcher:
             print(f"[ERROR] 获取 {code} 数据失败: {e}")
             return None
 
+    @staticmethod
+    def get_kline_history(code: str, scale: str = 'day', limit: int = 60) -> List[Dict]:
+        """
+        获取K线历史数据 (用于计算 BOLL/RSI)
+        scale: day, m15, m30, m60
+        """
+        normalized_code = StockDataFetcher.normalize_code(code)
+        # 腾讯K线接口
+        # param=code,scale,,,limit,qfq
+        # scale: day, m15, m30, m60
+        url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={normalized_code},{scale},,,{limit},qfq"
+        
+        try:
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
+                return []
+            
+            data = resp.json()
+            # 解析路径: data -> code -> scale
+            # 腾讯返回格式: ["2023-01-01", "open", "close", "high", "low", "vol"]
+            if 'data' in data and normalized_code in data['data']:
+                kline_data = data['data'][normalized_code].get(scale, [])
+                if not kline_data:
+                    # 尝试读取 qfqscale (前复权)
+                    kline_data = data['data'][normalized_code].get(f"qfq{scale}", [])
+                
+                history = []
+                for item in kline_data:
+                    if len(item) >= 6:
+                        history.append({
+                            "date": item[0],
+                            "open": float(item[1]),
+                            "close": float(item[2]),
+                            "high": float(item[3]),
+                            "low": float(item[4]),
+                            "volume": float(item[5])
+                        })
+                return history
+        except Exception as e:
+            print(f"[ERROR] 获取K线失败 {code}: {e}")
+        return []
+
 
 # ===== 技术指标计算 =====
 class TechnicalAnalysis:
@@ -287,6 +332,28 @@ class TechnicalAnalysis:
         rsi = 100 - (100 / (1 + rs))
         return round(rsi, 2)
     
+    @staticmethod
+    def calculate_boll(prices: List[float], period: int = 20, std_dev: int = 2) -> Optional[Dict[str, float]]:
+        """计算布林带 (BOLL)"""
+        if len(prices) < period:
+            return None
+        
+        # 取最近 period 个数据
+        recent_prices = prices[-period:]
+        
+        # 计算中轨 (MA)
+        mb = sum(recent_prices) / period
+        
+        # 计算标准差
+        variance = sum([((x - mb) ** 2) for x in recent_prices]) / period
+        std = variance ** 0.5
+        
+        # 计算上轨和下轨
+        up = mb + std_dev * std
+        dn = mb - std_dev * std
+        
+        return {"up": up, "mb": mb, "dn": dn}
+
     @staticmethod
     def calculate_volume_ratio(volumes: List[float]) -> Optional[float]:
         """计算量比（当前成交量/平均成交量）"""
@@ -440,59 +507,77 @@ class StockMonitor:
         self.alert_cooldown[key] = now
         return True
     
-    def monitor_single_stock(self, stock: Dict):
-        """监控单只股票"""
+    def monitor_single_stock(self, stock: Dict) -> Optional[Dict]:
+        """监控单只股票 (BOLL + RSI 策略)"""
         code = stock["code"]
         name = stock["name"]
         
-        # 获取实时数据
+        # 1. 获取实时数据
         data = StockDataFetcher.get_stock_data(code)
         if not data or data["price"] == 0:
-            return
+            return None
+            
+        current_price = data["price"]
+        change_pct = (current_price - data["pre_close"]) / data["pre_close"] * 100
         
-        # 保存价格记录
-        self.db.add_price_record(code, data["price"], data["volume"])
+        # 2. 获取K线历史 (用于计算指标)
+        # 获取最近 60 天日线数据
+        history = StockDataFetcher.get_kline_history(code, scale='day', limit=60)
         
-        # 获取历史数据
-        price_history = self.db.get_price_history(code, 20)
-        volume_history = self.db.get_volume_history(code, 5)
-        
-        if len(price_history) < 7:
-            return  # 数据不足
-        
-        # 计算技术指标
-        rsi = TechnicalAnalysis.calculate_rsi(price_history, self.config.RSI_PERIOD)
-        volume_ratio = TechnicalAnalysis.calculate_volume_ratio(volume_history)
-        change_pct = (data["price"] - data["pre_close"]) / data["pre_close"] * 100
-        
-        # 异动检测
         alerts = []
+        rsi_val = None
+        boll = None
         
-        # 1. RSI超买/超卖
-        if rsi is not None:
-            if rsi > self.config.RSI_OVERBOUGHT:
-                if self.check_alert_cooldown(code, "rsi_overbought"):
-                    alerts.append(f"⚠️ RSI({self.config.RSI_PERIOD}) = {rsi:.1f} （超买）")
-            elif rsi < self.config.RSI_OVERSOLD:
-                if self.check_alert_cooldown(code, "rsi_oversold"):
-                    alerts.append(f"✅ RSI({self.config.RSI_PERIOD}) = {rsi:.1f} （超卖）")
+        if history and len(history) >= self.config.BOLL_PERIOD:
+            # 提取收盘价列表
+            close_prices = [h["close"] for h in history]
+            # 把当前实时价格追加进去，作为最新的一根K线（近似）
+            close_prices.append(current_price)
+            
+            # 计算 RSI
+            rsi_val = TechnicalAnalysis.calculate_rsi(close_prices, self.config.RSI_PERIOD)
+            
+            # 计算 BOLL
+            boll = TechnicalAnalysis.calculate_boll(close_prices, self.config.BOLL_PERIOD, self.config.BOLL_STD)
+            
+            # === 策略逻辑 ===
+            
+            # 1. 买入信号：股价跌破下轨 且 RSI超卖
+            if boll and rsi_val is not None:
+                # 价格接近或低于下轨 (下轨 * 1.01 以内)
+                if current_price <= boll["dn"] * 1.01:
+                    if rsi_val < self.config.RSI_OVERSOLD:
+                        alerts.append(f"🟢 **买入机会**: 跌破布林下轨({boll['dn']:.2f}) + RSI超卖({rsi_val:.1f})")
+                    else:
+                        alerts.append(f"📉 触及布林下轨: {boll['dn']:.2f} (RSI: {rsi_val:.1f})")
+                
+                # 2. 卖出信号：股价突破上轨 且 RSI超买
+                elif current_price >= boll["up"] * 0.99:
+                    if rsi_val > self.config.RSI_OVERBOUGHT:
+                        alerts.append(f"🔴 **卖出机会**: 突破布林上轨({boll['up']:.2f}) + RSI超买({rsi_val:.1f})")
+                    else:
+                        alerts.append(f"📈 触及布林上轨: {boll['up']:.2f} (RSI: {rsi_val:.1f})")
         
-        # 2. 涨跌幅异常
-        if abs(change_pct) > self.config.PRICE_CHANGE_THRESHOLD:
-            if self.check_alert_cooldown(code, "price_change"):
-                emoji = "🚀" if change_pct > 0 else "💥"
-                alerts.append(f"{emoji} 日内波动 {change_pct:+.2f}%")
-        
-        # 3. 成交量放大
-        if volume_ratio and volume_ratio > self.config.VOLUME_RATIO_THRESHOLD:
-            if self.check_alert_cooldown(code, "volume_spike"):
-                alerts.append(f"📊 量比 {volume_ratio:.1f}x （成交量放大）")
-        
+        # 3. 暴涨暴跌兜底预警
+        if abs(change_pct) > 7: # 7% 阈值
+             emoji = "🚀" if change_pct > 0 else "💥"
+             alerts.append(f"{emoji} 股价剧烈波动: {change_pct:+.2f}%")
+
         # 发送提醒
         if alerts:
             self.notifier.send_alert(name, code, alerts, data)
             self.has_triggered_alert = True  # 标记本次触发了预警
             print(f"[ALERT] {datetime.now().strftime('%H:%M:%S')} {name} 触发 {len(alerts)} 个预警")
+            
+        # 返回当前状态供汇总
+        return {
+            "name": name,
+            "code": code,
+            "price": current_price,
+            "change_pct": change_pct,
+            "rsi": rsi_val if rsi_val else 0,
+            "has_alert": bool(alerts)
+        }
     
     def check_all_stocks(self):
         """检查所有股票一次"""
@@ -805,21 +890,21 @@ def main():
         # 2. 如果没有触发任何预警（即 check_all_stocks 内部没有发消息）
         # 我们需要统计一下监控结果
         if monitored_stocks:
-            stock_names = [s['name'] for s in monitored_stocks]
-            names_str = "、".join(stock_names)
-            if len(names_str) > 20:
-                names_str = names_str[:20] + "..."
+            # 构建详细的监控日报
+            lines = []
+            for s in monitored_stocks:
+                # 格式: 贵州茅台: 1850.0 (+1.2%)
+                price_str = f"{s['price']:.2f}"
+                pct_str = f"{s['change_pct']:+.2f}%"
+                # 根据涨跌幅加颜色emoji
+                emoji = "🔴" if s['change_pct'] > 0 else "🟢" if s['change_pct'] < 0 else "⚪"
+                lines.append(f"{emoji} {s['name']}: {price_str} ({pct_str})")
             
-            # 只有在没有异动时，才发送一条汇总的平安报
-            # 注意：monitor.check_all_stocks 内部如果有异动会直接发红色报警
-            # 这里我们假设如果 monitor.has_alerts (需要我们加个标记) 为 False 才发
+            content = "正在监控 {} 只股票：\n\n{}".format(len(monitored_stocks), "\n".join(lines))
+            content += "\n\n✅ 目前各项指标正常，无异动。"
             
             if not monitor.has_triggered_alert:
-                notifier.send_card(
-                    "🟢 监控正常",
-                    f"正在监控 {len(monitored_stocks)} 只股票：\n{names_str}\n\n✅ 目前各项指标正常，无异动。",
-                    "green"
-                )
+                notifier.send_card("🟢 监控正常", content, "green")
         else:
             # 列表为空的情况
             notifier.send_card(
