@@ -100,8 +100,12 @@ class Database:
             
     def sync_env_stocks(self):
         """同步环境变量中的股票到数据库"""
+        if not Config.STOCK_LIST:
+            print("[WARN] 环境变量 STOCK_LIST 为空")
+            return
+
         codes = Config.STOCK_LIST.split(",")
-        print(f"[INFO] 检测到环境变量配置股票: {len(codes)}只")
+        print(f"[INFO] 检测到环境变量配置股票: {len(codes)}只 -> {codes}")
         for code in codes:
             code = code.strip()
             if not code: continue
@@ -120,6 +124,8 @@ class Database:
                     if data:
                         self.add_stock(data["code"], data["name"])
                         print(f"[INFO] 自动添加股票: {data['name']}")
+                    else:
+                        print(f"[WARN] 获取股票数据失败: {code}")
             except Exception as e:
                 print(f"[WARN] 自动添加股票失败 {code}: {e}")
     
