@@ -420,6 +420,7 @@ class StockMonitor:
         self.config = config
         self.running = False
         self.alert_cooldown = {}  # 预警冷却时间（避免频繁提醒）
+        self.has_triggered_alert = False  # 本次检查是否触发过预警
     
     def check_alert_cooldown(self, code: str, alert_type: str) -> bool:
         """检查预警冷却时间（30分钟内同类型预警只发一次）"""
@@ -484,10 +485,13 @@ class StockMonitor:
         # 发送提醒
         if alerts:
             self.notifier.send_alert(name, code, alerts, data)
+            self.has_triggered_alert = True  # 标记本次触发了预警
             print(f"[ALERT] {datetime.now().strftime('%H:%M:%S')} {name} 触发 {len(alerts)} 个预警")
     
     def check_all_stocks(self):
         """检查所有股票一次"""
+        self.has_triggered_alert = False  # 重置标记
+        monitored_list = []
         try:
             stocks = self.db.get_all_stocks()
             if not stocks:
@@ -496,8 +500,10 @@ class StockMonitor:
                 print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} 开始检查 {len(stocks)} 只股票...")
                 for stock in stocks:
                     self.monitor_single_stock(stock)
+                    monitored_list.append(stock)
         except Exception as e:
             print(f"[ERROR] 监控检查异常: {e}")
+        return monitored_list
 
     def monitor_loop(self):
         """监控主循环"""
@@ -786,13 +792,36 @@ def main():
     # 如果是单次运行模式（用于 GitHub Actions）
     if is_once:
         print("🚀 单次运行模式启动...")
-        # 发送启动通知（可选，用于确认运行状态）
-        notifier.send_card(
-            "🤖 股票监控运行中",
-            f"GitHub Actions 定时任务已触发\n⏰ {datetime.now().strftime('%H:%M:%S')}",
-            "blue"
-        )
-        monitor.check_all_stocks()
+        
+        # 1. 先检查所有股票
+        monitored_stocks = monitor.check_all_stocks()
+        
+        # 2. 如果没有触发任何预警（即 check_all_stocks 内部没有发消息）
+        # 我们需要统计一下监控结果
+        if monitored_stocks:
+            stock_names = [s['name'] for s in monitored_stocks]
+            names_str = "、".join(stock_names)
+            if len(names_str) > 20:
+                names_str = names_str[:20] + "..."
+            
+            # 只有在没有异动时，才发送一条汇总的平安报
+            # 注意：monitor.check_all_stocks 内部如果有异动会直接发红色报警
+            # 这里我们假设如果 monitor.has_alerts (需要我们加个标记) 为 False 才发
+            
+            if not monitor.has_triggered_alert:
+                notifier.send_card(
+                    "🟢 监控正常",
+                    f"正在监控 {len(monitored_stocks)} 只股票：\n{names_str}\n\n✅ 目前各项指标正常，无异动。",
+                    "green"
+                )
+        else:
+            # 列表为空的情况
+            notifier.send_card(
+                "⚠️ 监控列表为空",
+                "请在 GitHub Variables 中配置 STOCK_LIST",
+                "yellow"
+            )
+            
         print("✅ 单次检查完成")
         return
 
