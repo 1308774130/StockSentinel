@@ -34,18 +34,32 @@ class Config:
     HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
     
     # 监控配置
-    CHECK_INTERVAL = 60  # 检查间隔(秒)
+    CHECK_INTERVAL = 600  # 检查间隔(秒)，用户要求10分钟
     
-    # 策略配置 (BOLL + RSI)
+    # 策略配置 (BOLL + RSI + MACD)
     RSI_PERIOD = 14       # RSI周期
     RSI_OVERBOUGHT = 70   # RSI超买阈值
     RSI_OVERSOLD = 30     # RSI超卖阈值
     
-    BOLL_PERIOD = 20      # 布林带周期 (通常20)
-    BOLL_STD = 2          # 布林带标准差倍数 (通常2)
+    BOLL_PERIOD = 20      # 布林带周期
+    BOLL_STD = 2          # 布林带标准差
     
-    # 股票列表（环境变量优先，用于 GitHub Actions）
-    STOCK_LIST = os.getenv("STOCK_LIST", "")
+    PRICE_CHANGE_THRESHOLD = 7 # 涨跌幅阈值
+    VOLUME_RATIO_THRESHOLD = 2 # 量比阈值
+    
+    # 用户持仓配置
+    USER_POSITIONS = {
+        "sh601015": {"name": "陕西黑猫", "cost": 6.375, "holdings": 900, "strategy": "T"},
+        "sh600984": {"name": "建设机械", "cost": 7.0, "holdings": 820, "strategy": "T"},
+        "sh603993": {"name": "洛阳钼业", "cost": 0, "holdings": 0, "strategy": "Short"}
+    }
+    
+    # 股票列表（合并环境变量和用户持仓）
+    _env_stocks = os.getenv("STOCK_LIST", "")
+    _stock_set = set(USER_POSITIONS.keys())
+    if _env_stocks:
+        _stock_set.update([s.strip() for s in _env_stocks.split(",") if s.strip()])
+    STOCK_LIST = ",".join(_stock_set)
     
     # 数据库
     DB_PATH = "stock_monitor.db"
@@ -313,6 +327,46 @@ class StockDataFetcher:
 # ===== 技术指标计算 =====
 class TechnicalAnalysis:
     @staticmethod
+    def calculate_ema(prices: List[float], period: int) -> List[float]:
+        """计算EMA"""
+        if not prices: return []
+        ema = []
+        multiplier = 2 / (period + 1)
+        for i, price in enumerate(prices):
+            if i == 0:
+                ema.append(price)
+            else:
+                ema.append((price - ema[-1]) * multiplier + ema[-1])
+        return ema
+
+    @staticmethod
+    def calculate_macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Optional[Dict[str, float]]:
+        """计算MACD"""
+        if len(prices) < slow + signal:
+            return None
+        
+        ema_fast = TechnicalAnalysis.calculate_ema(prices, fast)
+        ema_slow = TechnicalAnalysis.calculate_ema(prices, slow)
+        
+        # 确保长度一致，从后面对齐
+        min_len = min(len(ema_fast), len(ema_slow))
+        ema_fast = ema_fast[-min_len:]
+        ema_slow = ema_slow[-min_len:]
+        
+        dif = [f - s for f, s in zip(ema_fast, ema_slow)]
+        dea = TechnicalAnalysis.calculate_ema(dif, signal)
+        
+        if not dif or not dea:
+            return None
+
+        # 取最新值
+        curr_dif = dif[-1]
+        curr_dea = dea[-1]
+        curr_macd = (curr_dif - curr_dea) * 2
+        
+        return {"dif": curr_dif, "dea": curr_dea, "macd": curr_macd}
+
+    @staticmethod
     def calculate_rsi(prices: List[float], period: int = 6) -> Optional[float]:
         """计算RSI指标"""
         if len(prices) < period + 1:
@@ -508,9 +562,18 @@ class StockMonitor:
         return True
     
     def monitor_single_stock(self, stock: Dict) -> Optional[Dict]:
-        """监控单只股票 (BOLL + RSI 策略)"""
+        """监控单只股票 (BOLL + RSI + MACD)"""
         code = stock["code"]
         name = stock["name"]
+        
+        # 获取用户持仓信息
+        user_pos = self.config.USER_POSITIONS.get(code)
+        # 如果代码不匹配（比如 sh601015 vs 601015），尝试模糊匹配
+        if not user_pos:
+            for k, v in self.config.USER_POSITIONS.items():
+                if k in code or code in k:
+                    user_pos = v
+                    break
         
         # 1. 获取实时数据
         data = StockDataFetcher.get_stock_data(code)
@@ -521,55 +584,99 @@ class StockMonitor:
         change_pct = (current_price - data["pre_close"]) / data["pre_close"] * 100
         
         # 2. 获取K线历史 (用于计算指标)
-        # 获取最近 60 天日线数据
         history = StockDataFetcher.get_kline_history(code, scale='day', limit=60)
         
         alerts = []
         rsi_val = None
         boll = None
+        macd = None
         
-        if history and len(history) >= self.config.BOLL_PERIOD:
+        if history and len(history) >= 30: # 至少需要30天数据计算MACD
             # 提取收盘价列表
             close_prices = [h["close"] for h in history]
-            # 把当前实时价格追加进去，作为最新的一根K线（近似）
             close_prices.append(current_price)
             
-            # 计算 RSI
+            # 计算指标
             rsi_val = TechnicalAnalysis.calculate_rsi(close_prices, self.config.RSI_PERIOD)
-            
-            # 计算 BOLL
             boll = TechnicalAnalysis.calculate_boll(close_prices, self.config.BOLL_PERIOD, self.config.BOLL_STD)
+            macd = TechnicalAnalysis.calculate_macd(close_prices)
             
             # === 策略逻辑 ===
-            
-            # 1. 买入信号：股价跌破下轨 且 RSI超卖
-            if boll and rsi_val is not None:
-                # 价格接近或低于下轨 (下轨 * 1.01 以内)
-                if current_price <= boll["dn"] * 1.01:
-                    if rsi_val < self.config.RSI_OVERSOLD:
-                        alerts.append(f"🟢 **买入机会**: 跌破布林下轨({boll['dn']:.2f}) + RSI超卖({rsi_val:.1f})")
-                    else:
-                        alerts.append(f"📉 触及布林下轨: {boll['dn']:.2f} (RSI: {rsi_val:.1f})")
+            if boll and rsi_val is not None and macd:
+                # 基础信号
+                is_oversold = rsi_val < self.config.RSI_OVERSOLD
+                is_overbought = rsi_val > self.config.RSI_OVERBOUGHT
+                is_boll_low = current_price <= boll["dn"] * 1.01
+                is_boll_high = current_price >= boll["up"] * 0.99
+                is_macd_gold = macd["macd"] > 0 and macd["dif"] > macd["dea"] # 简单判断动能
+                is_macd_dead = macd["macd"] < 0 and macd["dif"] < macd["dea"]
+
+                # 策略判断
+                if user_pos:
+                    strategy = user_pos.get("strategy", "")
+                    cost = user_pos.get("cost", 0)
+                    
+                    # T策略 (高抛低吸)
+                    if strategy == "T":
+                        # 买点：超卖 + 触底 + (可选：低于成本或为了摊低成本)
+                        if is_boll_low and is_oversold:
+                             alerts.append(f"🟢 **T+0买入机会**: 触及布林下轨({boll['dn']:.2f}) + RSI超卖({rsi_val:.1f})")
+                        
+                        # 卖点：超买 + 触顶 + 高于成本(盈利)
+                        if is_boll_high and is_overbought:
+                            profit_msg = ""
+                            if cost > 0 and current_price > cost:
+                                profit_pct = (current_price - cost) / cost * 100
+                                profit_msg = f" (浮盈 {profit_pct:.1f}%)"
+                            alerts.append(f"🔴 **T+0卖出机会**: 触及布林上轨({boll['up']:.2f}) + RSI超买({rsi_val:.1f}){profit_msg}")
+                            
+                    # 短线策略
+                    elif strategy == "Short":
+                        if is_macd_gold and rsi_val > 50:
+                            alerts.append(f"🚀 **短线追涨**: MACD金叉 + RSI强势区域")
+                        elif is_boll_low and is_oversold:
+                             alerts.append(f"🟢 **短线抄底**: 触及布林下轨 + RSI超卖")
                 
-                # 2. 卖出信号：股价突破上轨 且 RSI超买
-                elif current_price >= boll["up"] * 0.99:
-                    if rsi_val > self.config.RSI_OVERBOUGHT:
-                        alerts.append(f"🔴 **卖出机会**: 突破布林上轨({boll['up']:.2f}) + RSI超买({rsi_val:.1f})")
-                    else:
-                        alerts.append(f"📈 触及布林上轨: {boll['up']:.2f} (RSI: {rsi_val:.1f})")
-        
+                # 通用兜底策略
+                if not alerts:
+                    if is_boll_low and is_oversold:
+                        alerts.append(f"🟢 触底反弹信号: BOLL下轨 + RSI超卖")
+                    elif is_boll_high and is_overbought:
+                        alerts.append(f"🔴 顶部风险信号: BOLL上轨 + RSI超买")
+
         # 3. 暴涨暴跌兜底预警
-        if abs(change_pct) > 7: # 7% 阈值
+        if abs(change_pct) > 7:
              emoji = "🚀" if change_pct > 0 else "💥"
              alerts.append(f"{emoji} 股价剧烈波动: {change_pct:+.2f}%")
 
-        # 发送提醒
+        # 构造消息内容
+        msg_content = f"📈 **{name} ({code})**\n"
+        msg_content += f"💰 现价: {current_price} ({change_pct:+.2f}%)\n"
+        
+        if user_pos:
+            cost = user_pos.get("cost", 0)
+            holdings = user_pos.get("holdings", 0)
+            if cost > 0:
+                profit = (current_price - cost) * holdings
+                profit_pct = (current_price - cost) / cost * 100
+                emoji = "🧧" if profit > 0 else "💸"
+                msg_content += f"{emoji} 持仓: {holdings}股 | 成本 {cost} | 盈亏 {profit:.0f} ({profit_pct:+.1f}%)\n"
+        
+        if boll and rsi_val is not None and macd:
+            msg_content += f"📊 指标: RSI={rsi_val:.1f} | MACD={macd['macd']:.3f}\n"
+            msg_content += f"📏 布林: 上{boll['up']:.2f} / 中{boll['mb']:.2f} / 下{boll['dn']:.2f}\n"
+        
         if alerts:
-            self.notifier.send_alert(name, code, alerts, data)
-            self.has_triggered_alert = True  # 标记本次触发了预警
-            print(f"[ALERT] {datetime.now().strftime('%H:%M:%S')} {name} 触发 {len(alerts)} 个预警")
-            
-        # 返回当前状态供汇总
+            msg_content += "\n⚠️ **建议操作:**\n" + "\n".join(alerts)
+            # 有建议时，发送红色/绿色卡片
+            color = "red" if any("卖" in a for a in alerts) else "green"
+            self.notifier.send_card(f"【交易提醒】{name}", msg_content, color)
+        else:
+            # 无建议时，仅发送当前价位（蓝色卡片）
+            # 注意：如果是在 check_all_stocks 循环中，可能会过于频繁
+            # 这里我们假设用户希望每10分钟收到一次报告，无论有无信号
+            self.notifier.send_card(f"【行情播报】{name}", msg_content, "blue")
+
         return {
             "name": name,
             "code": code,
@@ -888,28 +995,13 @@ def main():
         monitored_stocks = monitor.check_all_stocks()
         
         # 2. 如果没有触发任何预警（即 check_all_stocks 内部没有发消息）
-        # 我们需要统计一下监控结果
-        if monitored_stocks:
-            # 构建详细的监控日报
-            lines = []
-            for s in monitored_stocks:
-                # 格式: 贵州茅台: 1850.0 (+1.2%)
-                price_str = f"{s['price']:.2f}"
-                pct_str = f"{s['change_pct']:+.2f}%"
-                # 根据涨跌幅加颜色emoji
-                emoji = "🔴" if s['change_pct'] > 0 else "🟢" if s['change_pct'] < 0 else "⚪"
-                lines.append(f"{emoji} {s['name']}: {price_str} ({pct_str})")
-            
-            content = "正在监控 {} 只股票：\n\n{}".format(len(monitored_stocks), "\n".join(lines))
-            content += "\n\n✅ 目前各项指标正常，无异动。"
-            
-            if not monitor.has_triggered_alert:
-                notifier.send_card("🟢 监控正常", content, "green")
-        else:
+        # 注意：现在的逻辑是 monitor_single_stock 内部一定会发消息（无论有无预警）
+        # 所以这里不需要再发汇总报告了，除非列表为空
+        if not monitored_stocks:
             # 列表为空的情况
             notifier.send_card(
                 "⚠️ 监控列表为空",
-                "请在 GitHub Variables 中配置 STOCK_LIST",
+                "请在 GitHub Variables 中配置 STOCK_LIST 或检查代码配置",
                 "yellow"
             )
             
@@ -935,13 +1027,10 @@ def main():
     notifier.send_card(
         "🤖 机器人已启动",
         f"""股票监控机器人已成功启动！
-
+        
 ⏱️ 检查间隔: {config.CHECK_INTERVAL}秒
-📊 预警条件:
-• RSI超买: >{config.RSI_OVERBOUGHT}
-• RSI超卖: <{config.RSI_OVERSOLD}
-• 涨跌幅: >{config.PRICE_CHANGE_THRESHOLD}%
-• 量比: >{config.VOLUME_RATIO_THRESHOLD}x
+📊 监控股票: {len(config.USER_POSITIONS)}只重点关注 + 其他
+📈 策略: BOLL + RSI + MACD
 
 💡 **飞书交互命令:**
 在群里 @我 + 命令，例如：
