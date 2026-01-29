@@ -257,13 +257,21 @@ class StockDataFetcher:
             resp.raise_for_status()
             
             # 解析数据
-            text = resp.text
+            # 尝试使用 GBK 解码（腾讯接口通常返回 GBK）
+            try:
+                text = resp.content.decode('gbk')
+            except UnicodeDecodeError:
+                text = resp.text
+                
             if "pv_none_match" in text:
                 return None
             
-            data = text.split("～")
+            data = text.split("~")
             if len(data) < 35:
-                return None
+                # 兼容全角波浪号
+                data = text.split("～")
+                if len(data) < 35:
+                    return None
             
             return {
                 "name": data[1],

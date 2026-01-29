@@ -2,11 +2,11 @@ name: Stock Monitor
 
 on:
   schedule:
-    # 北京时间 9:30 - 15:00 之间，每 20 分钟运行一次
+    # 北京时间 9:30 - 15:00 之间，每 10 分钟运行一次
     # UTC 时间 = 北京时间 - 8
     # 1:30 UTC = 9:30 Beijing
     # 7:00 UTC = 15:00 Beijing
-    - cron: '*/20 1-7 * * 1-5'
+    - cron: '*/10 1-7 * * 1-5'
   workflow_dispatch:  # 允许手动触发
 
 jobs:
