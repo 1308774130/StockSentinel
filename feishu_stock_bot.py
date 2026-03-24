@@ -568,6 +568,17 @@ class StockMonitor:
         
         self.alert_cooldown[key] = now
         return True
+
+    def is_trading_session(self, now_local: datetime) -> bool:
+        """A股交易时段：工作日 09:30-11:30, 13:00-15:00。"""
+        weekday = now_local.weekday()  # Mon=0, Sun=6
+        if weekday >= 5:
+            return False
+
+        hhmm = now_local.hour * 100 + now_local.minute
+        in_morning = 930 <= hhmm <= 1130
+        in_afternoon = 1300 <= hhmm <= 1500
+        return in_morning or in_afternoon
     
     def monitor_single_stock(self, stock: Dict) -> Optional[Dict]:
         """监控单只股票 (BOLL + RSI + MACD)"""
@@ -700,6 +711,11 @@ class StockMonitor:
         monitored_list = []
         try:
             stocks = self.db.get_all_stocks()
+            now_local = datetime.now()
+            in_trading = self.is_trading_session(now_local)
+            if not in_trading:
+                print(f"[INFO] {now_local.strftime('%H:%M:%S')} 非交易时段，跳过检查")
+                return monitored_list
             if not stocks:
                 print("[INFO] 没有监控的股票，等待添加...")
             else:
@@ -1001,11 +1017,14 @@ def main():
         
         # 1. 先检查所有股票
         monitored_stocks = monitor.check_all_stocks()
+        db_stocks = db.get_all_stocks()
+        in_trading_now = monitor.is_trading_session(datetime.now())
         
         # 2. 如果没有触发任何预警（即 check_all_stocks 内部没有发消息）
         # 注意：现在的逻辑是 monitor_single_stock 内部一定会发消息（无论有无预警）
         # 所以这里不需要再发汇总报告了，除非列表为空
-        if not monitored_stocks:
+        should_send_empty_list_warning = (len(db_stocks) == 0) and in_trading_now
+        if should_send_empty_list_warning:
             # 列表为空的情况
             notifier.send_card(
                 "⚠️ 监控列表为空",
