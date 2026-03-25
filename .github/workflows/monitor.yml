@@ -31,7 +31,6 @@ jobs:
     - name: Run Monitor
       env:
         FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
-        # 在 GitHub 仓库 Settings -> Secrets and variables -> Actions -> Variables 中配置
         STOCK_LIST: ${{ vars.STOCK_LIST }}
       run: |
         python feishu_stock_bot.py --once
